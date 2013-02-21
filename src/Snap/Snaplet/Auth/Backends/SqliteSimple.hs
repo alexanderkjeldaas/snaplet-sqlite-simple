@@ -65,7 +65,6 @@ data SqliteAuthManager = SqliteAuthManager
     , pamConnPool    :: MVar S.Connection
     }
 
-
 ------------------------------------------------------------------------------
 -- | Initializer for the sqlite backend to the auth snaplet.
 --
@@ -119,12 +118,12 @@ createInitialSchema conn pamTable = do
           ]
   S.execute_ conn q
 
-createInitialRoleSchema :: S.Connection -> T.Text -> IO ()
-createInitialRoleSchema conn tblName = do
+createInitialRoleSchema :: S.Connection -> T.Text -> T.Text -> IO ()
+createInitialRoleSchema conn tblName authTbl = do
   let q = Query $ T.concat
           [ "CREATE TABLE ", tblName
-          , " (auth_uid INTEGER NOT NULL,"
-          , "data text text);"
+          , " (uid INTEGER REFERENCES ", authTbl, "(uid) ON UPDATE CASCADE"
+          , ", data text text);"
           ]
   S.execute_ conn q
 
@@ -170,9 +169,9 @@ upgradeSchema conn pam fromVersion = do
 
     upgrade 2 = do
       S.execute_ conn (addColumnQ (authColMeta pam))
-      let roleName = roleTblName pam
+      let (roleName, authName) = (roleTblName pam, authTblName pam)
       roleTblExists <- tableExists conn roleName
-      unless roleTblExists $ createInitialRoleSchema conn roleName
+      unless roleTblExists $ createInitialRoleSchema conn roleName authName
 
     upgrade _ = error "unknown version"
 
@@ -344,7 +343,9 @@ authColNames pam =
   T.intercalate "," . map (\(f,_) -> fst (f pam)) $ authColDef
 
 saveQuery :: AuthTable -> AuthUser -> (Text, [SQLData])
-saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
+saveQuery at u@AuthUser{..} =
+  maybe insertQuery updateQuery userId `mappend`
+  saveRoleQuery at userLogin userRoles
   where
     insertQuery =  (T.concat [ "INSERT INTO "
                              , authTblName at
@@ -372,18 +373,24 @@ saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
     params = map (($u) . snd) $ tail authColDef
 
 saveRoleQuery :: AuthTable
-              -> UserId
+              -> T.Text
+              -- ^ The login of the AuthUser
               -> [Role]
+              -- ^ The roles of the AuthUser
               -> (Text, [SQLData])
-saveRoleQuery authTbl uid roles =
+saveRoleQuery at login roles =
   mconcat $ deleteExisting : map insertRole roles
   where
-    deleteExisting       = ( T.concat [ "delete from ", roleTblName authTbl
-                                      , " where auth_uid=?" ]
-                           , [S.toField $ unUid uid])
-    insertRole (Role bs) = ( T.concat [ "insert into ", roleTblName authTbl
-                                     , " (auth_uid,data) values (?,?)"]
-                           , [S.toField $ unUid uid, S.toField bs])
+    atName = authTblName at
+    roName = roleTblName at
+    deleteExisting       = ( T.concat [ "DELETE FROM ", roName
+                                      , " JOIN ", atName
+                                      , " USING (uid) WHERE login = ?);" ]
+                           , [S.toField login])
+    insertRole (Role bs) = ( T.concat [ "INSERT INTO ", roName, " (uid,data)"
+                                     , " SELECT uid, ? FROM ", atName
+                                     , " WHERE login = ?);"]
+                           , [S.toField bs, S.toField login])
 
 ------------------------------------------------------------------------------
 -- |
@@ -406,8 +413,6 @@ instance IAuthBackend SqliteAuthManager where
             res <- S.query conn q2 [userLogin]
             case res of
               [savedUser] -> return $ Right savedUser
-                -- let (qstr, params) = saveRoleQuery pamTable (userId savedUser)
-                --                      (userRoles savedUser)
               _           -> return . Left $ AuthError "snaplet-sqlite-simple: Failed user save"
 
     -- lookupByUserId :: SqliteAuthManager -> UserId -> IO (Maybe AuthUser)
