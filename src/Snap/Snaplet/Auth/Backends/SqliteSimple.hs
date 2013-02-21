@@ -59,8 +59,10 @@ import           Web.ClientSession
 
 
 data SqliteAuthManager = SqliteAuthManager
-    { pamTable    :: AuthTable
-    , pamConnPool :: MVar S.Connection
+    { pamTable       :: AuthTable
+    , userRoleTable  :: RoleTable
+    , userMetaTable  :: MetaTable
+    , pamConnPool    :: MVar S.Connection
     }
 
 
@@ -74,10 +76,14 @@ initSqliteAuth
 initSqliteAuth sess db = makeSnaplet "sqlite-auth" desc datadir $ do
     config <- getSnapletUserConfig
     authTable <- liftIO $ C.lookupDefault "snap_auth_user" config "authTable"
+    roleTable <- liftIO $ C.lookupDefault "snap_auth_user" config "roleTable"
+    metaTable <- liftIO $ C.lookupDefault "snap_auth_user" config "metaTable"
     authSettings <- authSettingsFromConfig
     key <- liftIO $ getKey (asSiteKey authSettings)
-    let tableDesc = defAuthTable { tblName = authTable }
-    let manager = SqliteAuthManager tableDesc $
+    let authTableDesc = defAuthTable { authTblName = authTable }
+    let roleTableDesc = defRoleTable { roleTblName = roleTable }
+    let metaTableDesc = defMetaTable { metaTblName = metaTable }
+    let manager = SqliteAuthManager authTableDesc roleTableDesc metaTableDesc $
                                       sqliteConn $ db ^# snapletValue
     liftIO $ createTableIfMissing manager
     rng <- liftIO mkRNG
@@ -107,7 +113,7 @@ tableExists conn tblName = do
 createInitialSchema :: S.Connection -> AuthTable -> IO ()
 createInitialSchema conn pamTable = do
   let q = Query $ T.concat
-          [ "CREATE TABLE ", tblName pamTable, " (uid INTEGER PRIMARY KEY,"
+          [ "CREATE TABLE ", authTblName pamTable, " (uid INTEGER PRIMARY KEY,"
           , "login text UNIQUE NOT NULL,"
           , "password text,"
           , "activated_at timestamp,suspended_at timestamp,remember_token text,"
@@ -119,7 +125,7 @@ createInitialSchema conn pamTable = do
   S.execute_ conn q
 
 versionTable :: AuthTable -> T.Text
-versionTable pamTable = T.concat [tblName pamTable, "_version"]
+versionTable pamTable = T.concat [authTblName pamTable, "_version"]
 
 schemaVersion :: S.Connection -> AuthTable -> IO Int
 schemaVersion conn pamTable = do
@@ -148,14 +154,17 @@ upgradeSchema conn pam fromVersion = do
       S.execute_ conn (Query $ T.concat ["INSERT INTO  ", versionTable pam, " VALUES (1)"])
 
     upgrade 1 = do
-      S.execute_ conn (addColumnQ (colEmail pam))
-      S.execute_ conn (addColumnQ (colResetToken pam))
-      S.execute_ conn (addColumnQ (colResetRequestedAt pam))
+      S.execute_ conn (addColumnQ (authColEmail pam))
+      S.execute_ conn (addColumnQ (authColResetToken pam))
+      S.execute_ conn (addColumnQ (authColResetRequestedAt pam))
+
+    -- upgrade 2 = do
+    --   S.execute_ conn (addColumnQ (
 
     upgrade _ = error "unknown version"
 
     addColumnQ (c,t) =
-      Query $ T.concat [ "ALTER TABLE ", tblName pam, " ADD COLUMN ", c, " ", t]
+      Query $ T.concat [ "ALTER TABLE ", authTblName pam, " ADD COLUMN ", c, " ", t]
 
 
 ------------------------------------------------------------------------------
@@ -163,8 +172,9 @@ upgradeSchema conn pam fromVersion = do
 createTableIfMissing :: SqliteAuthManager -> IO ()
 createTableIfMissing SqliteAuthManager{..} = do
     withMVar pamConnPool $ \conn -> do
-      authTblExists <- tableExists conn $ tblName pamTable
+      authTblExists <- tableExists conn $ authTblName pamTable
       unless authTblExists $ createInitialSchema conn pamTable
+      --roleTblExists <- tableExists conn $ authTblName 
       upgradeSchema conn pamTable 0
       upgradeSchema conn pamTable 1
 
@@ -243,86 +253,127 @@ instance S.ToField Password where
 -- | Datatype containing the names of the columns for the authentication table.
 data AuthTable
   =  AuthTable
-  {  tblName             :: Text
-  ,  colId               :: (Text, Text)
-  ,  colLogin            :: (Text, Text)
-  ,  colEmail            :: (Text, Text)
-  ,  colPassword         :: (Text, Text)
-  ,  colActivatedAt      :: (Text, Text)
-  ,  colSuspendedAt      :: (Text, Text)
-  ,  colRememberToken    :: (Text, Text)
-  ,  colLoginCount       :: (Text, Text)
-  ,  colFailedLoginCount :: (Text, Text)
-  ,  colLockedOutUntil   :: (Text, Text)
-  ,  colCurrentLoginAt   :: (Text, Text)
-  ,  colLastLoginAt      :: (Text, Text)
-  ,  colCurrentLoginIp   :: (Text, Text)
-  ,  colLastLoginIp      :: (Text, Text)
-  ,  colCreatedAt        :: (Text, Text)
-  ,  colUpdatedAt        :: (Text, Text)
-  ,  colResetToken       :: (Text, Text)
-  ,  colResetRequestedAt :: (Text, Text)
+  {  authTblName             :: Text
+  ,  authColId               :: (Text, Text)
+  ,  authColLogin            :: (Text, Text)
+  ,  authColEmail            :: (Text, Text)
+  ,  authColPassword         :: (Text, Text)
+  ,  authColActivatedAt      :: (Text, Text)
+  ,  authColSuspendedAt      :: (Text, Text)
+  ,  authColRememberToken    :: (Text, Text)
+  ,  authColLoginCount       :: (Text, Text)
+  ,  authColFailedLoginCount :: (Text, Text)
+  ,  authColLockedOutUntil   :: (Text, Text)
+  ,  authColCurrentLoginAt   :: (Text, Text)
+  ,  authColLastLoginAt      :: (Text, Text)
+  ,  authColCurrentLoginIp   :: (Text, Text)
+  ,  authColLastLoginIp      :: (Text, Text)
+  ,  authColCreatedAt        :: (Text, Text)
+  ,  authColUpdatedAt        :: (Text, Text)
+  ,  authColResetToken       :: (Text, Text)
+  ,  authColResetRequestedAt :: (Text, Text)
   }
 
+data RoleTable
+  =  RoleTable
+  {  roleTblName   :: Text
+  ,  roleColAuthId :: (Text, Text)
+  ,  roleColData   :: (Text, Text)
+  }
+
+data MetaTable
+  =  MetaTable
+  {  metaTblName   :: Text
+  ,  metaColAuthId :: (Text, Text)
+  ,  metaColKey    :: (Text, Text)
+  ,  metaColValue  :: (Text, Text)
+  }
 
 -- | Default authentication table layout
 defAuthTable :: AuthTable
 defAuthTable
   =  AuthTable
-  {  tblName             = "snap_auth_user"
-  ,  colId               = ("uid", "INTEGER PRIMARY KEY")
-  ,  colLogin            = ("login", "text UNIQUE NOT NULL")
-  ,  colEmail            = ("email", "text")
-  ,  colPassword         = ("password", "text")
-  ,  colActivatedAt      = ("activated_at", "timestamp")
-  ,  colSuspendedAt      = ("suspended_at", "timestamp")
-  ,  colRememberToken    = ("remember_token", "text")
-  ,  colLoginCount       = ("login_count", "INTEGER NOT NULL")
-  ,  colFailedLoginCount = ("failed_login_count", "INTEGER NOT NULL")
-  ,  colLockedOutUntil   = ("locked_out_until", "timestamp")
-  ,  colCurrentLoginAt   = ("current_login_at", "timestamp")
-  ,  colLastLoginAt      = ("last_login_at", "timestamp")
-  ,  colCurrentLoginIp   = ("current_login_ip", "text")
-  ,  colLastLoginIp      = ("last_login_ip", "text")
-  ,  colCreatedAt        = ("created_at", "timestamp")
-  ,  colUpdatedAt        = ("updated_at", "timestamp")
-  ,  colResetToken       = ("reset_token", "text")
-  ,  colResetRequestedAt = ("reset_requested_at", "timestamp")
+  {  authTblName             = "snap_auth_user"
+  ,  authColId               = ("uid", "INTEGER PRIMARY KEY")
+  ,  authColLogin            = ("login", "text UNIQUE NOT NULL")
+  ,  authColEmail            = ("email", "text")
+  ,  authColPassword         = ("password", "text")
+  ,  authColActivatedAt      = ("activated_at", "timestamp")
+  ,  authColSuspendedAt      = ("suspended_at", "timestamp")
+  ,  authColRememberToken    = ("remember_token", "text")
+  ,  authColLoginCount       = ("login_count", "INTEGER NOT NULL")
+  ,  authColFailedLoginCount = ("failed_login_count", "INTEGER NOT NULL")
+  ,  authColLockedOutUntil   = ("locked_out_until", "timestamp")
+  ,  authColCurrentLoginAt   = ("current_login_at", "timestamp")
+  ,  authColLastLoginAt      = ("last_login_at", "timestamp")
+  ,  authColCurrentLoginIp   = ("current_login_ip", "text")
+  ,  authColLastLoginIp      = ("last_login_ip", "text")
+  ,  authColCreatedAt        = ("created_at", "timestamp")
+  ,  authColUpdatedAt        = ("updated_at", "timestamp")
+  ,  authColResetToken       = ("reset_token", "text")
+  ,  authColResetRequestedAt = ("reset_requested_at", "timestamp")
+  }
+
+-- | Default authentication role table layout
+defRoleTable :: RoleTable
+defRoleTable
+  =  RoleTable
+  {  roleTblName             = "snap_auth_role"
+  ,  roleColAuthId           = ("auth_uid", "INTEGER NOT NULL")
+  ,  roleColData             = ("data", "text")
+  }
+
+-- | Default authentication meta table layout
+defMetaTable :: MetaTable
+defMetaTable
+  =  MetaTable
+  {  metaTblName             = "snap_auth_meta"
+  ,  metaColAuthId           = ("auth_uid", "INTEGER NOT NULL")
+  ,  metaColKey              = ("key", "text")
+  ,  metaColValue            = ("key", "text")
   }
 
 -- | List of deconstructors so it's easier to extract column names from an
 -- 'AuthTable'.
-colDef :: [(AuthTable -> (Text, Text), AuthUser -> SQLData)]
-colDef =
-  [ (colId              , S.toField . fmap unUid . userId)
-  , (colLogin           , S.toField . userLogin)
-  , (colEmail           , S.toField . userEmail)
-  , (colPassword        , S.toField . userPassword)
-  , (colActivatedAt     , S.toField . userActivatedAt)
-  , (colSuspendedAt     , S.toField . userSuspendedAt)
-  , (colRememberToken   , S.toField . userRememberToken)
-  , (colLoginCount      , S.toField . userLoginCount)
-  , (colFailedLoginCount, S.toField . userFailedLoginCount)
-  , (colLockedOutUntil  , S.toField . userLockedOutUntil)
-  , (colCurrentLoginAt  , S.toField . userCurrentLoginAt)
-  , (colLastLoginAt     , S.toField . userLastLoginAt)
-  , (colCurrentLoginIp  , S.toField . userCurrentLoginIp)
-  , (colLastLoginIp     , S.toField . userLastLoginIp)
-  , (colCreatedAt       , S.toField . userCreatedAt)
-  , (colUpdatedAt       , S.toField . userUpdatedAt)
-  , (colResetToken      , S.toField . userResetToken)
-  , (colResetRequestedAt, S.toField . userResetRequestedAt)
+authColDef :: [(AuthTable -> (Text, Text), AuthUser -> SQLData)]
+authColDef =
+  [ (authColId              , S.toField . fmap unUid . userId)
+  , (authColLogin           , S.toField . userLogin)
+  , (authColEmail           , S.toField . userEmail)
+  , (authColPassword        , S.toField . userPassword)
+  , (authColActivatedAt     , S.toField . userActivatedAt)
+  , (authColSuspendedAt     , S.toField . userSuspendedAt)
+  , (authColRememberToken   , S.toField . userRememberToken)
+  , (authColLoginCount      , S.toField . userLoginCount)
+  , (authColFailedLoginCount, S.toField . userFailedLoginCount)
+  , (authColLockedOutUntil  , S.toField . userLockedOutUntil)
+  , (authColCurrentLoginAt  , S.toField . userCurrentLoginAt)
+  , (authColLastLoginAt     , S.toField . userLastLoginAt)
+  , (authColCurrentLoginIp  , S.toField . userCurrentLoginIp)
+  , (authColLastLoginIp     , S.toField . userLastLoginIp)
+  , (authColCreatedAt       , S.toField . userCreatedAt)
+  , (authColUpdatedAt       , S.toField . userUpdatedAt)
+  , (authColResetToken      , S.toField . userResetToken)
+  , (authColResetRequestedAt, S.toField . userResetRequestedAt)
   ]
 
-colNames :: AuthTable -> T.Text
-colNames pam =
-  T.intercalate "," . map (\(f,_) -> fst (f pam)) $ colDef
+-- -- | List of deconstructors so it's easier to extract column names from an
+-- -- 'AuthTable'.
+-- roleColDef :: [(RoleTable -> (Text, Text), AuthUser -> SQLData)]
+-- roleColDef =
+--   [ (roleColAuthId          , S.toField . fmap unUid . userId)
+--   , (roleColData            , S.toField . userEmail)
+--   ]
+
+authColNames :: AuthTable -> T.Text
+authColNames pam =
+  T.intercalate "," . map (\(f,_) -> fst (f pam)) $ authColDef
 
 saveQuery :: AuthTable -> AuthUser -> (Text, [SQLData])
 saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
   where
     insertQuery =  (T.concat [ "INSERT INTO "
-                             , tblName at
+                             , authTblName at
                              , " ("
                              , T.intercalate "," cols
                              , ") VALUES ("
@@ -333,17 +384,17 @@ saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
     qval f  = fst (f at) `T.append` " = ?"
     updateQuery uid =
         (T.concat [ "UPDATE "
-                  , tblName at
+                  , authTblName at
                   , " SET "
-                  , T.intercalate "," (map (qval . fst) $ tail colDef)
+                  , T.intercalate "," (map (qval . fst) $ tail authColDef)
                   , " WHERE "
-                  , fst (colId at)
+                  , fst (authColId at)
                   , " = ?"
                   ]
         , params ++ [S.toField $ unUid uid])
-    cols = map (fst . ($at) . fst) $ tail colDef
+    cols = map (fst . ($at) . fst) $ tail authColDef
     vals = map (const "?") cols
-    params = map (($u) . snd) $ tail colDef
+    params = map (($u) . snd) $ tail authColDef
 
 
 ------------------------------------------------------------------------------
@@ -357,10 +408,10 @@ instance IAuthBackend SqliteAuthManager where
             -- that calls here.
             S.execute conn (Query qstr) params
             let q2 = Query $ T.concat
-                     [ "select ", colNames pamTable, " from "
-                     , tblName pamTable
+                     [ "select ", authColNames pamTable, " from "
+                     , authTblName pamTable
                      , " where "
-                     , fst (colLogin pamTable)
+                     , fst (authColLogin pamTable)
                      , " = ?"
                      ]
             res <- S.query conn q2 [userLogin]
@@ -370,30 +421,30 @@ instance IAuthBackend SqliteAuthManager where
 
     lookupByUserId SqliteAuthManager{..} uid = do
         let q = Query $ T.concat
-                [ "select ", colNames pamTable, " from "
-                , tblName pamTable
+                [ "select ", authColNames pamTable, " from "
+                , authTblName pamTable
                 , " where "
-                , fst (colId pamTable)
+                , fst (authColId pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [unUid uid]
 
     lookupByLogin SqliteAuthManager{..} login = do
         let q = Query $ T.concat
-                [ "select ", colNames pamTable, " from "
-                , tblName pamTable
+                [ "select ", authColNames pamTable, " from "
+                , authTblName pamTable
                 , " where "
-                , fst (colLogin pamTable)
+                , fst (authColLogin pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [login]
 
     lookupByRememberToken SqliteAuthManager{..} token = do
         let q = Query $ T.concat
-                [ "select ", colNames pamTable, " from "
-                , tblName pamTable
+                [ "select ", authColNames pamTable, " from "
+                , authTblName pamTable
                 , " where "
-                , fst (colRememberToken pamTable)
+                , fst (authColRememberToken pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [token]
@@ -401,9 +452,9 @@ instance IAuthBackend SqliteAuthManager where
     destroy SqliteAuthManager{..} AuthUser{..} = do
         let q = Query $ T.concat
                 [ "delete from "
-                , tblName pamTable
+                , authTblName pamTable
                 , " where "
-                , fst (colLogin pamTable)
+                , fst (authColLogin pamTable)
                 , " = ?"
                 ]
         authExecute pamConnPool q [userLogin]
