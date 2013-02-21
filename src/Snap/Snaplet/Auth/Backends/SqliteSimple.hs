@@ -39,9 +39,11 @@ module Snap.Snaplet.Auth.Backends.SqliteSimple
 
 ------------------------------------------------------------------------------
 import           Control.Concurrent
+import qualified Data.Aeson as A
+import qualified Data.ByteString.Lazy          as BL
 import qualified Data.Configurator as C
-import qualified Data.HashMap.Lazy as HM
 import           Data.Maybe
+import           Data.Monoid
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Database.SQLite.Simple as S
@@ -60,8 +62,6 @@ import           Web.ClientSession
 
 data SqliteAuthManager = SqliteAuthManager
     { pamTable       :: AuthTable
-    , userRoleTable  :: RoleTable
-    , userMetaTable  :: MetaTable
     , pamConnPool    :: MVar S.Connection
     }
 
@@ -79,8 +79,7 @@ initSqliteAuth sess db = makeSnaplet "sqlite-auth" desc datadir $ do
     authSettings <- authSettingsFromConfig
     key <- liftIO $ getKey (asSiteKey authSettings)
     let authTableDesc = defAuthTable { authTblName = authTable }
-    let manager = SqliteAuthManager authTableDesc defRoleTable defMetaTable $
-                                      sqliteConn $ db ^# snapletValue
+    let manager = SqliteAuthManager authTableDesc $ sqliteConn $ db ^# snapletValue
     liftIO $ createTablesIfMissing manager
     rng <- liftIO mkRNG
     return $ AuthManager
@@ -129,24 +128,11 @@ createInitialRoleSchema conn tblName = do
           ]
   S.execute_ conn q
 
-createInitialMetaSchema :: S.Connection -> T.Text -> IO ()
-createInitialMetaSchema conn tblName = do
-  let q = Query $ T.concat
-          [ "CREATE TABLE ", tblName
-          , " (auth_uid INTEGER NOT NULL,"
-          , "key text,"
-          , "value text);"
-          ]
-  S.execute_ conn q
-
 versionTblName :: AuthTable -> T.Text
 versionTblName pamTable = T.concat [authTblName pamTable, "_version"]
 
 roleTblName :: AuthTable -> T.Text
 roleTblName pamTable = T.concat [authTblName pamTable, "_role"]
-
-metaTblName :: AuthTable -> T.Text
-metaTblName pamTable = T.concat [authTblName pamTable, "_meta"]
 
 schemaVersion :: S.Connection -> AuthTable -> IO Int
 schemaVersion conn pamTable = do
@@ -183,11 +169,10 @@ upgradeSchema conn pam fromVersion = do
       S.execute_ conn (addColumnQ (authColResetRequestedAt pam))
 
     upgrade 2 = do
-      let (roleName, metaName) = (roleTblName pam, metaTblName pam)
+      S.execute_ conn (addColumnQ (authColMeta pam))
+      let roleName = roleTblName pam
       roleTblExists <- tableExists conn roleName
       unless roleTblExists $ createInitialRoleSchema conn roleName
-      metaTblExists <- tableExists conn metaName
-      unless metaTblExists $ createInitialMetaSchema conn metaName
 
     upgrade _ = error "unknown version"
 
@@ -215,6 +200,8 @@ instance FromField UserId where
 instance FromField Password where
     fromField f = Encrypted <$> fromField f
 
+
+
 instance FromRow AuthUser where
     fromRow =
         AuthUser
@@ -237,7 +224,7 @@ instance FromRow AuthUser where
         <*> _userResetToken
         <*> _userResetRequestedAt
         <*> _userRoles
-        <*> _userMeta
+        <*> fmap (fromJust . A.decode' . BL.fromStrict) _userMeta
       where
         !_userId               = field
         !_userLogin            = field
@@ -258,7 +245,7 @@ instance FromRow AuthUser where
         !_userResetToken       = field
         !_userResetRequestedAt = field
         !_userRoles            = pure []
-        !_userMeta             = pure HM.empty
+        !_userMeta             = field
 
 
 querySingle :: (ToRow q, FromRow a)
@@ -275,7 +262,6 @@ authExecute pool q ps = do
 instance S.ToField Password where
     toField (ClearText bs) = S.toField bs
     toField (Encrypted bs) = S.toField bs
-
 
 -- | Datatype containing the names of the columns for the authentication table.
 data AuthTable
@@ -299,19 +285,7 @@ data AuthTable
   ,  authColUpdatedAt        :: (Text, Text)
   ,  authColResetToken       :: (Text, Text)
   ,  authColResetRequestedAt :: (Text, Text)
-  }
-
-data RoleTable
-  =  RoleTable
-  {  roleColAuthId :: (Text, Text)
-  ,  roleColData   :: (Text, Text)
-  }
-
-data MetaTable
-  =  MetaTable
-  {  metaColAuthId :: (Text, Text)
-  ,  metaColKey    :: (Text, Text)
-  ,  metaColValue  :: (Text, Text)
+  ,  authColMeta             :: (Text, Text)
   }
 
 -- | Default authentication table layout
@@ -337,23 +311,7 @@ defAuthTable
   ,  authColUpdatedAt        = ("updated_at", "timestamp")
   ,  authColResetToken       = ("reset_token", "text")
   ,  authColResetRequestedAt = ("reset_requested_at", "timestamp")
-  }
-
--- | Default authentication role table layout
-defRoleTable :: RoleTable
-defRoleTable
-  =  RoleTable
-  {  roleColAuthId           = ("auth_uid", "INTEGER NOT NULL")
-  ,  roleColData             = ("data", "text")
-  }
-
--- | Default authentication meta table layout
-defMetaTable :: MetaTable
-defMetaTable
-  =  MetaTable
-  {  metaColAuthId           = ("auth_uid", "INTEGER NOT NULL")
-  ,  metaColKey              = ("key", "text")
-  ,  metaColValue            = ("key", "text")
+  ,  authColMeta             = ("meta_json", "text")
   }
 
 -- | List of deconstructors so it's easier to extract column names from an
@@ -378,15 +336,8 @@ authColDef =
   , (authColUpdatedAt       , S.toField . userUpdatedAt)
   , (authColResetToken      , S.toField . userResetToken)
   , (authColResetRequestedAt, S.toField . userResetRequestedAt)
+  , (authColMeta            , S.toField . A.encode . userMeta)
   ]
-
--- -- | List of deconstructors so it's easier to extract column names from an
--- -- 'AuthTable'.
--- roleColDef :: [(RoleTable -> (Text, Text), AuthUser -> SQLData)]
--- roleColDef =
---   [ (roleColAuthId          , S.toField . fmap unUid . userId)
---   , (roleColData            , S.toField . userEmail)
---   ]
 
 authColNames :: AuthTable -> T.Text
 authColNames pam =
@@ -415,14 +366,29 @@ saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
                   , " = ?"
                   ]
         , params ++ [S.toField $ unUid uid])
+    -- The list of column names
     cols = map (fst . ($at) . fst) $ tail authColDef
     vals = map (const "?") cols
     params = map (($u) . snd) $ tail authColDef
 
+saveRoleQuery :: AuthTable
+              -> UserId
+              -> [Role]
+              -> (Text, [SQLData])
+saveRoleQuery authTbl uid roles =
+  mconcat $ deleteExisting : map insertRole roles
+  where
+    deleteExisting       = ( T.concat [ "delete from ", roleTblName authTbl
+                                      , " where auth_uid=?" ]
+                           , [S.toField $ unUid uid])
+    insertRole (Role bs) = ( T.concat [ "insert into ", roleTblName authTbl
+                                     , " (auth_uid,data) values (?,?)"]
+                           , [S.toField $ unUid uid, S.toField bs])
 
 ------------------------------------------------------------------------------
 -- |
 instance IAuthBackend SqliteAuthManager where
+    -- save :: SqliteAuthManager -> AuthUser -> IO (Either AuthFailure AuthUser)
     save SqliteAuthManager{..} u@AuthUser{..} = do
         let (qstr, params) = saveQuery pamTable u
         withMVar pamConnPool $ \conn -> do
@@ -440,8 +406,11 @@ instance IAuthBackend SqliteAuthManager where
             res <- S.query conn q2 [userLogin]
             case res of
               [savedUser] -> return $ Right savedUser
+                -- let (qstr, params) = saveRoleQuery pamTable (userId savedUser)
+                --                      (userRoles savedUser)
               _           -> return . Left $ AuthError "snaplet-sqlite-simple: Failed user save"
 
+    -- lookupByUserId :: SqliteAuthManager -> UserId -> IO (Maybe AuthUser)
     lookupByUserId SqliteAuthManager{..} uid = do
         let q = Query $ T.concat
                 [ "select ", authColNames pamTable, " from "
@@ -452,6 +421,7 @@ instance IAuthBackend SqliteAuthManager where
                 ]
         querySingle pamConnPool q [unUid uid]
 
+    -- lookupByLogin :: SqliteAuthManager -> T.Text -> IO (Maybe AuthUser)
     lookupByLogin SqliteAuthManager{..} login = do
         let q = Query $ T.concat
                 [ "select ", authColNames pamTable, " from "
@@ -462,6 +432,7 @@ instance IAuthBackend SqliteAuthManager where
                 ]
         querySingle pamConnPool q [login]
 
+    -- lookupByRememberToken :: SqliteAuthManager -> T.Text -> IO (Maybe AuthUser)
     lookupByRememberToken SqliteAuthManager{..} token = do
         let q = Query $ T.concat
                 [ "select ", authColNames pamTable, " from "
@@ -472,6 +443,7 @@ instance IAuthBackend SqliteAuthManager where
                 ]
         querySingle pamConnPool q [token]
 
+    -- destroy :: SqliteAuthManager -> AuthUser -> IO ()
     destroy SqliteAuthManager{..} AuthUser{..} = do
         let q = Query $ T.concat
                 [ "delete from "
