@@ -296,8 +296,8 @@ defAuthTable
   ,  authColUpdatedAt        = ("updated_at", "timestamp")
   ,  authColResetToken       = ("reset_token", "text")
   ,  authColResetRequestedAt = ("reset_requested_at", "timestamp")
-  ,  authColRoles            = ("roles_json", "text")
-  ,  authColMeta             = ("meta_json", "text")
+  ,  authColRoles            = ("roles_json", "blob")
+  ,  authColMeta             = ("meta_json", "blob")
   }
 
 -- | List of deconstructors so it's easier to extract column names from an
