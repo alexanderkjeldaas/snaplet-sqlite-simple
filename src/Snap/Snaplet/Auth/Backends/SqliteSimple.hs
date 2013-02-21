@@ -60,9 +60,10 @@ import           Web.ClientSession
 
 
 data SqliteAuthManager = SqliteAuthManager
-    { pamTable       :: AuthTable
-    , pamConnPool    :: MVar S.Connection
+    { pamTable    :: AuthTable
+    , pamConnPool :: MVar S.Connection
     }
+
 
 ------------------------------------------------------------------------------
 -- | Initializer for the sqlite backend to the auth snaplet.
@@ -76,9 +77,10 @@ initSqliteAuth sess db = makeSnaplet "sqlite-auth" desc datadir $ do
     authTable <- liftIO $ C.lookupDefault "snap_auth_user" config "authTable"
     authSettings <- authSettingsFromConfig
     key <- liftIO $ getKey (asSiteKey authSettings)
-    let authTableDesc = defAuthTable { authTblName = authTable }
-    let manager = SqliteAuthManager authTableDesc $ sqliteConn $ db ^# snapletValue
-    liftIO $ createTablesIfMissing manager
+    let tableDesc = defAuthTable { tblName = authTable }
+    let manager = SqliteAuthManager tableDesc $
+                                      sqliteConn $ db ^# snapletValue
+    liftIO $ createTableIfMissing manager
     rng <- liftIO mkRNG
     return $ AuthManager
       { backend = manager
@@ -106,7 +108,7 @@ tableExists conn tblName = do
 createInitialSchema :: S.Connection -> AuthTable -> IO ()
 createInitialSchema conn pamTable = do
   let q = Query $ T.concat
-          [ "CREATE TABLE ", authTblName pamTable, " (uid INTEGER PRIMARY KEY,"
+          [ "CREATE TABLE ", tblName pamTable, " (uid INTEGER PRIMARY KEY,"
           , "login text UNIQUE NOT NULL,"
           , "password text,"
           , "activated_at timestamp,suspended_at timestamp,remember_token text,"
@@ -117,12 +119,12 @@ createInitialSchema conn pamTable = do
           ]
   S.execute_ conn q
 
-versionTblName :: AuthTable -> T.Text
-versionTblName pamTable = T.concat [authTblName pamTable, "_version"]
+versionTable :: AuthTable -> T.Text
+versionTable pamTable = T.concat [tblName pamTable, "_version"]
 
 schemaVersion :: S.Connection -> AuthTable -> IO Int
 schemaVersion conn pamTable = do
-  let verTbl = versionTblName pamTable
+  let verTbl = versionTable pamTable
   versionExists <- tableExists conn verTbl
   if not versionExists
     then return 0
@@ -134,8 +136,7 @@ schemaVersion conn pamTable = do
 
 setSchemaVersion :: S.Connection -> AuthTable -> Int -> IO ()
 setSchemaVersion conn pamTable v = do
-  let q = Query $ T.concat ["UPDATE ", versionTblName pamTable
-                           ," SET version = ?"]
+  let q = Query $ T.concat ["UPDATE ", versionTable pamTable, " SET version = ?"]
   S.execute conn q (Only v)
 
 upgradeSchema :: Connection -> AuthTable -> Int -> IO ()
@@ -144,10 +145,8 @@ upgradeSchema conn pam fromVersion = do
   when (ver == fromVersion) (upgrade ver >> setSchemaVersion conn pam (fromVersion+1))
   where
     upgrade 0 = do
-      S.execute_ conn (Query $ T.concat ["CREATE TABLE ", versionTblName pam
-                                        ," (version INTEGER)"])
-      S.execute_ conn (Query $ T.concat ["INSERT INTO  ", versionTblName pam
-                                        ," VALUES (1)"])
+      S.execute_ conn (Query $ T.concat ["CREATE TABLE ", versionTable pam, " (version INTEGER)"])
+      S.execute_ conn (Query $ T.concat ["INSERT INTO  ", versionTable pam, " VALUES (1)"])
 
     upgrade 1 = do
       S.execute_ conn (addColumnQ (colEmail pam))
@@ -161,19 +160,20 @@ upgradeSchema conn pam fromVersion = do
     upgrade _ = error "unknown version"
 
     addColumnQ (c,t) =
-      Query $ T.concat [ "ALTER TABLE ", authTblName pam, " ADD COLUMN ", c, " ", t]
+      Query $ T.concat [ "ALTER TABLE ", tblName pam, " ADD COLUMN ", c, " ", t]
 
 
 ------------------------------------------------------------------------------
 -- | Create the user table if it doesn't exist.
-createTablesIfMissing :: SqliteAuthManager -> IO ()
-createTablesIfMissing SqliteAuthManager{..} = do
+createTableIfMissing :: SqliteAuthManager -> IO ()
+createTableIfMissing SqliteAuthManager{..} = do
     withMVar pamConnPool $ \conn -> do
-      authTblExists <- tableExists conn $ authTblName pamTable
+      authTblExists <- tableExists conn $ tblName pamTable
       unless authTblExists $ createInitialSchema conn pamTable
       upgradeSchema conn pamTable 0
       upgradeSchema conn pamTable 1
       upgradeSchema conn pamTable 2
+
 
 buildUid :: Int -> UserId
 buildUid = UserId . T.pack . show
@@ -183,8 +183,6 @@ instance FromField UserId where
 
 instance FromField Password where
     fromField f = Encrypted <$> fromField f
-
-
 
 instance FromRow AuthUser where
     fromRow =
@@ -247,10 +245,11 @@ instance S.ToField Password where
     toField (ClearText bs) = S.toField bs
     toField (Encrypted bs) = S.toField bs
 
+
 -- | Datatype containing the names of the columns for the authentication table.
 data AuthTable
   =  AuthTable
-  {  authTblName             :: Text
+  {  tblName             :: Text
   ,  colId               :: (Text, Text)
   ,  colLogin            :: (Text, Text)
   ,  colEmail            :: (Text, Text)
@@ -269,15 +268,14 @@ data AuthTable
   ,  colUpdatedAt        :: (Text, Text)
   ,  colResetToken       :: (Text, Text)
   ,  colResetRequestedAt :: (Text, Text)
-  ,  colRoles            :: (Text, Text)
-  ,  colMeta             :: (Text, Text)
   }
+
 
 -- | Default authentication table layout
 defAuthTable :: AuthTable
 defAuthTable
   =  AuthTable
-  {  authTblName             = "snap_auth_user"
+  {  tblName             = "snap_auth_user"
   ,  colId               = ("uid", "INTEGER PRIMARY KEY")
   ,  colLogin            = ("login", "text UNIQUE NOT NULL")
   ,  colEmail            = ("email", "text")
@@ -334,7 +332,7 @@ saveQuery :: AuthTable -> AuthUser -> (Text, [SQLData])
 saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
   where
     insertQuery =  (T.concat [ "INSERT INTO "
-                             , authTblName at
+                             , tblName at
                              , " ("
                              , T.intercalate "," cols
                              , ") VALUES ("
@@ -345,7 +343,7 @@ saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
     qval f  = fst (f at) `T.append` " = ?"
     updateQuery uid =
         (T.concat [ "UPDATE "
-                  , authTblName at
+                  , tblName at
                   , " SET "
                   , T.intercalate "," (map (qval . fst) $ tail colDef)
                   , " WHERE "
@@ -358,10 +356,10 @@ saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
     vals = map (const "?") cols
     params = map (($u) . snd) $ tail colDef
 
+
 ------------------------------------------------------------------------------
 -- |
 instance IAuthBackend SqliteAuthManager where
-    -- save :: SqliteAuthManager -> AuthUser -> IO (Either AuthFailure AuthUser)
     save SqliteAuthManager{..} u@AuthUser{..} = do
         let (qstr, params) = saveQuery pamTable u
         withMVar pamConnPool $ \conn -> do
@@ -371,7 +369,7 @@ instance IAuthBackend SqliteAuthManager where
             S.execute conn (Query qstr) params
             let q2 = Query $ T.concat
                      [ "select ", colNames pamTable, " from "
-                     , authTblName pamTable
+                     , tblName pamTable
                      , " where "
                      , fst (colLogin pamTable)
                      , " = ?"
@@ -381,44 +379,40 @@ instance IAuthBackend SqliteAuthManager where
               [savedUser] -> return $ Right savedUser
               _           -> return . Left $ AuthError "snaplet-sqlite-simple: Failed user save"
 
-    -- lookupByUserId :: SqliteAuthManager -> UserId -> IO (Maybe AuthUser)
     lookupByUserId SqliteAuthManager{..} uid = do
         let q = Query $ T.concat
                 [ "select ", colNames pamTable, " from "
-                , authTblName pamTable
+                , tblName pamTable
                 , " where "
                 , fst (colId pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [unUid uid]
 
-    -- lookupByLogin :: SqliteAuthManager -> T.Text -> IO (Maybe AuthUser)
     lookupByLogin SqliteAuthManager{..} login = do
         let q = Query $ T.concat
                 [ "select ", colNames pamTable, " from "
-                , authTblName pamTable
+                , tblName pamTable
                 , " where "
                 , fst (colLogin pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [login]
 
-    -- lookupByRememberToken :: SqliteAuthManager -> T.Text -> IO (Maybe AuthUser)
     lookupByRememberToken SqliteAuthManager{..} token = do
         let q = Query $ T.concat
                 [ "select ", colNames pamTable, " from "
-                , authTblName pamTable
+                , tblName pamTable
                 , " where "
                 , fst (colRememberToken pamTable)
                 , " = ?"
                 ]
         querySingle pamConnPool q [token]
 
-    -- destroy :: SqliteAuthManager -> AuthUser -> IO ()
     destroy SqliteAuthManager{..} AuthUser{..} = do
         let q = Query $ T.concat
                 [ "delete from "
-                , authTblName pamTable
+                , tblName pamTable
                 , " where "
                 , fst (colLogin pamTable)
                 , " = ?"
