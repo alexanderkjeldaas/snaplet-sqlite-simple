@@ -76,16 +76,12 @@ initSqliteAuth
 initSqliteAuth sess db = makeSnaplet "sqlite-auth" desc datadir $ do
     config <- getSnapletUserConfig
     authTable <- liftIO $ C.lookupDefault "snap_auth_user" config "authTable"
-    roleTable <- liftIO $ C.lookupDefault "snap_auth_user" config "roleTable"
-    metaTable <- liftIO $ C.lookupDefault "snap_auth_user" config "metaTable"
     authSettings <- authSettingsFromConfig
     key <- liftIO $ getKey (asSiteKey authSettings)
     let authTableDesc = defAuthTable { authTblName = authTable }
-    let roleTableDesc = defRoleTable { roleTblName = roleTable }
-    let metaTableDesc = defMetaTable { metaTblName = metaTable }
-    let manager = SqliteAuthManager authTableDesc roleTableDesc metaTableDesc $
+    let manager = SqliteAuthManager authTableDesc defRoleTable defMetaTable $
                                       sqliteConn $ db ^# snapletValue
-    liftIO $ createTableIfMissing manager
+    liftIO $ createTablesIfMissing manager
     rng <- liftIO mkRNG
     return $ AuthManager
       { backend = manager
@@ -124,12 +120,37 @@ createInitialSchema conn pamTable = do
           ]
   S.execute_ conn q
 
-versionTable :: AuthTable -> T.Text
-versionTable pamTable = T.concat [authTblName pamTable, "_version"]
+createInitialRoleSchema :: S.Connection -> T.Text -> IO ()
+createInitialRoleSchema conn tblName = do
+  let q = Query $ T.concat
+          [ "CREATE TABLE ", tblName
+          , " (auth_uid INTEGER NOT NULL,"
+          , "data text text);"
+          ]
+  S.execute_ conn q
+
+createInitialMetaSchema :: S.Connection -> T.Text -> IO ()
+createInitialMetaSchema conn tblName = do
+  let q = Query $ T.concat
+          [ "CREATE TABLE ", tblName
+          , " (auth_uid INTEGER NOT NULL,"
+          , "key text,"
+          , "value text);"
+          ]
+  S.execute_ conn q
+
+versionTblName :: AuthTable -> T.Text
+versionTblName pamTable = T.concat [authTblName pamTable, "_version"]
+
+roleTblName :: AuthTable -> T.Text
+roleTblName pamTable = T.concat [authTblName pamTable, "_role"]
+
+metaTblName :: AuthTable -> T.Text
+metaTblName pamTable = T.concat [authTblName pamTable, "_meta"]
 
 schemaVersion :: S.Connection -> AuthTable -> IO Int
 schemaVersion conn pamTable = do
-  let verTbl = versionTable pamTable
+  let verTbl = versionTblName pamTable
   versionExists <- tableExists conn verTbl
   if not versionExists
     then return 0
@@ -141,7 +162,8 @@ schemaVersion conn pamTable = do
 
 setSchemaVersion :: S.Connection -> AuthTable -> Int -> IO ()
 setSchemaVersion conn pamTable v = do
-  let q = Query $ T.concat ["UPDATE ", versionTable pamTable, " SET version = ?"]
+  let q = Query $ T.concat ["UPDATE ", versionTblName pamTable
+                           ," SET version = ?"]
   S.execute conn q (Only v)
 
 upgradeSchema :: Connection -> AuthTable -> Int -> IO ()
@@ -150,16 +172,22 @@ upgradeSchema conn pam fromVersion = do
   when (ver == fromVersion) (upgrade ver >> setSchemaVersion conn pam (fromVersion+1))
   where
     upgrade 0 = do
-      S.execute_ conn (Query $ T.concat ["CREATE TABLE ", versionTable pam, " (version INTEGER)"])
-      S.execute_ conn (Query $ T.concat ["INSERT INTO  ", versionTable pam, " VALUES (1)"])
+      S.execute_ conn (Query $ T.concat ["CREATE TABLE ", versionTblName pam
+                                        ," (version INTEGER)"])
+      S.execute_ conn (Query $ T.concat ["INSERT INTO  ", versionTblName pam
+                                        ," VALUES (1)"])
 
     upgrade 1 = do
       S.execute_ conn (addColumnQ (authColEmail pam))
       S.execute_ conn (addColumnQ (authColResetToken pam))
       S.execute_ conn (addColumnQ (authColResetRequestedAt pam))
 
-    -- upgrade 2 = do
-    --   S.execute_ conn (addColumnQ (
+    upgrade 2 = do
+      let (roleName, metaName) = (roleTblName pam, metaTblName pam)
+      roleTblExists <- tableExists conn roleName
+      unless roleTblExists $ createInitialRoleSchema conn roleName
+      metaTblExists <- tableExists conn metaName
+      unless metaTblExists $ createInitialMetaSchema conn metaName
 
     upgrade _ = error "unknown version"
 
@@ -169,15 +197,14 @@ upgradeSchema conn pam fromVersion = do
 
 ------------------------------------------------------------------------------
 -- | Create the user table if it doesn't exist.
-createTableIfMissing :: SqliteAuthManager -> IO ()
-createTableIfMissing SqliteAuthManager{..} = do
+createTablesIfMissing :: SqliteAuthManager -> IO ()
+createTablesIfMissing SqliteAuthManager{..} = do
     withMVar pamConnPool $ \conn -> do
       authTblExists <- tableExists conn $ authTblName pamTable
       unless authTblExists $ createInitialSchema conn pamTable
-      --roleTblExists <- tableExists conn $ authTblName 
       upgradeSchema conn pamTable 0
       upgradeSchema conn pamTable 1
-
+      upgradeSchema conn pamTable 2
 
 buildUid :: Int -> UserId
 buildUid = UserId . T.pack . show
@@ -276,15 +303,13 @@ data AuthTable
 
 data RoleTable
   =  RoleTable
-  {  roleTblName   :: Text
-  ,  roleColAuthId :: (Text, Text)
+  {  roleColAuthId :: (Text, Text)
   ,  roleColData   :: (Text, Text)
   }
 
 data MetaTable
   =  MetaTable
-  {  metaTblName   :: Text
-  ,  metaColAuthId :: (Text, Text)
+  {  metaColAuthId :: (Text, Text)
   ,  metaColKey    :: (Text, Text)
   ,  metaColValue  :: (Text, Text)
   }
@@ -318,8 +343,7 @@ defAuthTable
 defRoleTable :: RoleTable
 defRoleTable
   =  RoleTable
-  {  roleTblName             = "snap_auth_role"
-  ,  roleColAuthId           = ("auth_uid", "INTEGER NOT NULL")
+  {  roleColAuthId           = ("auth_uid", "INTEGER NOT NULL")
   ,  roleColData             = ("data", "text")
   }
 
@@ -327,8 +351,7 @@ defRoleTable
 defMetaTable :: MetaTable
 defMetaTable
   =  MetaTable
-  {  metaTblName             = "snap_auth_meta"
-  ,  metaColAuthId           = ("auth_uid", "INTEGER NOT NULL")
+  {  metaColAuthId           = ("auth_uid", "INTEGER NOT NULL")
   ,  metaColKey              = ("key", "text")
   ,  metaColValue            = ("key", "text")
   }
