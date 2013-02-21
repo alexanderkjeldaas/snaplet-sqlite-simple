@@ -43,7 +43,6 @@ import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy          as BL
 import qualified Data.Configurator as C
 import           Data.Maybe
-import           Data.Monoid
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Database.SQLite.Simple as S
@@ -118,20 +117,8 @@ createInitialSchema conn pamTable = do
           ]
   S.execute_ conn q
 
-createInitialRoleSchema :: S.Connection -> T.Text -> T.Text -> IO ()
-createInitialRoleSchema conn tblName authTbl = do
-  let q = Query $ T.concat
-          [ "CREATE TABLE ", tblName
-          , " (uid INTEGER REFERENCES ", authTbl, "(uid) ON UPDATE CASCADE"
-          , ", data text text);"
-          ]
-  S.execute_ conn q
-
 versionTblName :: AuthTable -> T.Text
 versionTblName pamTable = T.concat [authTblName pamTable, "_version"]
-
-roleTblName :: AuthTable -> T.Text
-roleTblName pamTable = T.concat [authTblName pamTable, "_role"]
 
 schemaVersion :: S.Connection -> AuthTable -> IO Int
 schemaVersion conn pamTable = do
@@ -168,10 +155,8 @@ upgradeSchema conn pam fromVersion = do
       S.execute_ conn (addColumnQ (authColResetRequestedAt pam))
 
     upgrade 2 = do
+      S.execute_ conn (addColumnQ (authColRoles pam))
       S.execute_ conn (addColumnQ (authColMeta pam))
-      let (roleName, authName) = (roleTblName pam, authTblName pam)
-      roleTblExists <- tableExists conn roleName
-      unless roleTblExists $ createInitialRoleSchema conn roleName authName
 
     upgrade _ = error "unknown version"
 
@@ -222,7 +207,7 @@ instance FromRow AuthUser where
         <*> _userUpdatedAt
         <*> _userResetToken
         <*> _userResetRequestedAt
-        <*> _userRoles
+        <*> fmap (fromJust . A.decode' . BL.fromStrict) _userRoles
         <*> fmap (fromJust . A.decode' . BL.fromStrict) _userMeta
       where
         !_userId               = field
@@ -243,7 +228,7 @@ instance FromRow AuthUser where
         !_userUpdatedAt        = field
         !_userResetToken       = field
         !_userResetRequestedAt = field
-        !_userRoles            = pure []
+        !_userRoles            = field
         !_userMeta             = field
 
 
@@ -284,6 +269,7 @@ data AuthTable
   ,  authColUpdatedAt        :: (Text, Text)
   ,  authColResetToken       :: (Text, Text)
   ,  authColResetRequestedAt :: (Text, Text)
+  ,  authColRoles            :: (Text, Text)
   ,  authColMeta             :: (Text, Text)
   }
 
@@ -310,6 +296,7 @@ defAuthTable
   ,  authColUpdatedAt        = ("updated_at", "timestamp")
   ,  authColResetToken       = ("reset_token", "text")
   ,  authColResetRequestedAt = ("reset_requested_at", "timestamp")
+  ,  authColRoles            = ("roles_json", "text")
   ,  authColMeta             = ("meta_json", "text")
   }
 
@@ -335,6 +322,7 @@ authColDef =
   , (authColUpdatedAt       , S.toField . userUpdatedAt)
   , (authColResetToken      , S.toField . userResetToken)
   , (authColResetRequestedAt, S.toField . userResetRequestedAt)
+  , (authColRoles           , S.toField . A.encode . userRoles)
   , (authColMeta            , S.toField . A.encode . userMeta)
   ]
 
@@ -343,9 +331,7 @@ authColNames pam =
   T.intercalate "," . map (\(f,_) -> fst (f pam)) $ authColDef
 
 saveQuery :: AuthTable -> AuthUser -> (Text, [SQLData])
-saveQuery at u@AuthUser{..} =
-  maybe insertQuery updateQuery userId `mappend`
-  saveRoleQuery at userLogin userRoles
+saveQuery at u@AuthUser{..} = maybe insertQuery updateQuery userId
   where
     insertQuery =  (T.concat [ "INSERT INTO "
                              , authTblName at
@@ -371,26 +357,6 @@ saveQuery at u@AuthUser{..} =
     cols = map (fst . ($at) . fst) $ tail authColDef
     vals = map (const "?") cols
     params = map (($u) . snd) $ tail authColDef
-
-saveRoleQuery :: AuthTable
-              -> T.Text
-              -- ^ The login of the AuthUser
-              -> [Role]
-              -- ^ The roles of the AuthUser
-              -> (Text, [SQLData])
-saveRoleQuery at login roles =
-  mconcat $ deleteExisting : map insertRole roles
-  where
-    atName = authTblName at
-    roName = roleTblName at
-    deleteExisting       = ( T.concat [ "DELETE FROM ", roName
-                                      , " JOIN ", atName
-                                      , " USING (uid) WHERE login = ?);" ]
-                           , [S.toField login])
-    insertRole (Role bs) = ( T.concat [ "INSERT INTO ", roName, " (uid,data)"
-                                     , " SELECT uid, ? FROM ", atName
-                                     , " WHERE login = ?);"]
-                           , [S.toField bs, S.toField login])
 
 ------------------------------------------------------------------------------
 -- |
